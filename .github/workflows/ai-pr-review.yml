@@ -71,12 +71,14 @@ jobs:
               ;;
           esac
           
+          # Build prompt with diff content
+          DIFF_CONTENT=$(cat pr.diff | head -c 50000)
           FULL_PROMPT="$PROMPT
 
 Here is the PR diff to review:
 
 \`\`\`diff
-$(cat pr.diff | head -c 50000)
+$DIFF_CONTENT
 \`\`\`
 
 Please analyze the code and output your findings as a JSON array."
