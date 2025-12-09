@@ -76,7 +76,7 @@ jobs:
 Here is the PR diff to review:
 
 \`\`\`diff
-$(cat pr.diff)
+$(cat pr.diff | head -c 50000)
 \`\`\`
 
 Please analyze the code and output your findings as a JSON array."
