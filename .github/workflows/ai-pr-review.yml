@@ -75,7 +75,7 @@ jobs:
 
 Here is the PR diff to review:
 
-\`\`\`
+\`\`\`diff
 $(cat pr.diff)
 \`\`\`
 
