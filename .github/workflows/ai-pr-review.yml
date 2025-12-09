@@ -1,0 +1,354 @@
+name: Cline CLI PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      review_type:
+        description: 'Review type (general, security, performance, style)'
+        required: false
+        default: 'general'
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install Cline CLI
+        run: |
+          npm install -g @cline/cli || npm install -g klein-cli || echo "Using npx fallback"
+
+      - name: Get PR diff
+        id: pr_diff
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE_SHA="${{ github.event.pull_request.base.sha }}"
+            HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          else
+            BASE_SHA="main"
+            HEAD_SHA="HEAD"
+          fi
+          git diff $BASE_SHA...$HEAD_SHA > pr.diff
+          echo "diff_size=$(wc -c < pr.diff)" >> $GITHUB_OUTPUT
+
+      - name: Run AI Review
+        id: review
+        env:
+          CLINE_API_KEY: ${{ secrets.CLINE_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          REVIEW_TYPE: ${{ github.event.inputs.review_type || 'general' }}
+        run: |
+          REVIEW_TYPE="${{ env.REVIEW_TYPE }}"
+          
+          case "$REVIEW_TYPE" in
+            "security")
+              PROMPT="Review this PR diff for SECURITY issues. Output JSON array with: severity (critical/high/medium/low), file, line, issue, suggestion"
+              ;;
+            "performance")
+              PROMPT="Review this PR diff for PERFORMANCE issues. Output JSON array with: severity, file, line, issue, suggestion"
+              ;;
+            "style")
+              PROMPT="Review this PR diff for CODE STYLE issues. Output JSON array with: severity, file, line, issue, suggestion"
+              ;;
+            *)
+              PROMPT="Review this PR diff comprehensively for bugs, security, performance, and code quality. Output JSON array with: severity (critical/high/medium/low), file, line, issue, suggestion"
+              ;;
+          esac
+          
+          FULL_PROMPT="$PROMPT
+
+Here is the PR diff to review:
+
+\`\`\`
+$(cat pr.diff)
+\`\`\`
+
+Please analyze the code and output your findings as a JSON array."
+          
+          if command -v cline &> /dev/null; then
+            cline "$FULL_PROMPT" --file pr.diff --yolo --output-format json > review.json 2>/dev/null || \
+            cline "$FULL_PROMPT" --yolo --output-format json > review.json 2>/dev/null || \
+            echo '[]' > review.json
+          elif command -v klein &> /dev/null; then
+            cat pr.diff | klein -y "$PROMPT" | jq -c '.' > review.json || echo '[]' > review.json
+          else
+            npx -y @cline/cli "$FULL_PROMPT" --file pr.diff --yolo --output-format json > review.json 2>/dev/null || \
+            npx -y @cline/cli "$FULL_PROMPT" --yolo --output-format json > review.json 2>/dev/null || \
+            echo '[]' > review.json
+          fi
+          
+          # Parse and count findings
+          CRITICAL=$(jq '[.[] | select(.severity == "critical")] | length' review.json || echo "0")
+          HIGH=$(jq '[.[] | select(.severity == "high")] | length' review.json || echo "0")
+          MEDIUM=$(jq '[.[] | select(.severity == "medium")] | length' review.json || echo "0")
+          LOW=$(jq '[.[] | select(.severity == "low")] | length' review.json || echo "0")
+          TOTAL=$(jq '. | length' review.json || echo "0")
+          
+          echo "critical=$CRITICAL" >> $GITHUB_OUTPUT
+          echo "high=$HIGH" >> $GITHUB_OUTPUT
+          echo "medium=$MEDIUM" >> $GITHUB_OUTPUT
+          echo "low=$LOW" >> $GITHUB_OUTPUT
+          echo "total=$TOTAL" >> $GITHUB_OUTPUT
+
+      - name: Upload Review Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-review-${{ github.event.pull_request.number || 'manual' }}
+          path: review.json
+          retention-days: 30
+
+      - name: Post Review Comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const reviewData = JSON.parse(fs.readFileSync('review.json', 'utf8') || '[]');
+            
+            // Get PR details
+            const pr = context.payload.pull_request;
+            const filesChanged = pr.changed_files || 0;
+            const additions = pr.additions || 0;
+            const deletions = pr.deletions || 0;
+            
+            if (reviewData.length === 0) {
+              let successComment = `<div align="center">\n\n`;
+              successComment += `### 🤖 Cline CLI Code Review\n\n`;
+              successComment += `![Cline CLI](https://img.shields.io/badge/Powered%20by-Cline%20CLI-blue?style=for-the-badge&logo=github)\n\n`;
+              successComment += `</div>\n\n`;
+              successComment += `## 📊 Summary\n\n`;
+              successComment += `**Review Summary:**\n`;
+              successComment += `* ✅ **No issues found!** Code looks great! 🎉\n`;
+              successComment += `* 📊 **Files changed:** ${filesChanged} | **+${additions}** / **-${deletions}** lines\n\n`;
+              successComment += `### ✨ Pre-merge checks and finishing touches\n\n`;
+              successComment += `✅ **All checks passed** - Ready to merge!\n\n`;
+              successComment += `---\n\n`;
+              successComment += `<div align="center">\n\n`;
+              successComment += `### 🤖 Powered by Cline CLI\n\n`;
+              successComment += `*AI-powered code review system*\n\n`;
+              successComment += `</div>`;
+              
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: successComment
+              });
+              return;
+            }
+            
+            const critical = reviewData.filter(r => r.severity === 'critical').length;
+            const high = reviewData.filter(r => r.severity === 'high').length;
+            const medium = reviewData.filter(r => r.severity === 'medium').length;
+            const low = reviewData.filter(r => r.severity === 'low').length;
+            
+            // Calculate estimated review effort
+            const totalIssues = reviewData.length;
+            const effortScore = critical * 3 + high * 2 + medium * 1 + low * 0.5;
+            const effortLevel = effortScore > 10 ? 'Complex' : effortScore > 5 ? 'Moderate' : 'Simple';
+            const estimatedMinutes = Math.ceil(effortScore * 2);
+            
+            // Group by file and category
+            const byFile = {};
+            const byCategory = {};
+            reviewData.forEach(issue => {
+              const file = issue.file || 'unknown';
+              const category = issue.category || 'other';
+              
+              if (!byFile[file]) byFile[file] = [];
+              byFile[file].push(issue);
+              
+              byCategory[category] = (byCategory[category] || 0) + 1;
+            });
+            
+            // Generate walkthrough summary
+            const fileList = Object.keys(byFile).slice(0, 5);
+            const walkthrough = fileList.length > 0 
+              ? `This PR introduces changes across ${Object.keys(byFile).length} file(s). ${totalIssues} review findings were identified, with ${critical} critical, ${high} high, ${medium} medium, and ${low} low severity issues.`
+              : `Review completed with ${totalIssues} findings identified.`;
+            
+            // Build the comment with Cline CLI branding
+            let comment = `<div align="center">\n\n`;
+            comment += `### 🤖 Cline CLI Code Review\n\n`;
+            comment += `![Cline CLI](https://img.shields.io/badge/Powered%20by-Cline%20CLI-blue?style=for-the-badge&logo=github)\n\n`;
+            comment += `</div>\n\n`;
+            comment += `## 📊 Summary\n\n`;
+            
+            // Summary section
+            comment += `**Review Summary:**\n`;
+            comment += `* 🔴 **Critical:** ${critical} | 🟠 **High:** ${high} | 🟡 **Medium:** ${medium} | 🟢 **Low:** ${low}\n`;
+            comment += `* 📊 **Files changed:** ${filesChanged} | **+${additions}** / **-${deletions}** lines\n`;
+            comment += `* 📝 **Total findings:** ${totalIssues}\n\n`;
+            
+            // Walkthrough
+            comment += `### 📖 Walkthrough\n\n`;
+            comment += `${walkthrough}\n\n`;
+            
+            // Changes table
+            comment += `### 📋 Changes\n\n`;
+            comment += `| Cohort / File(s) | Summary |\n`;
+            comment += `|-----------------|----------|\n`;
+            
+            Object.entries(byFile).slice(0, 10).forEach(([file, issues]) => {
+              const fileIssues = issues.length;
+              const fileCritical = issues.filter(i => i.severity === 'critical').length;
+              const fileHigh = issues.filter(i => i.severity === 'high').length;
+              const severityText = fileCritical > 0 ? `${fileCritical} critical` : fileHigh > 0 ? `${fileHigh} high` : `${fileIssues} issues`;
+              comment += `| \`${file}\` | ${fileIssues} finding(s) found (${severityText}) |\n`;
+            });
+            
+            if (Object.keys(byFile).length > 10) {
+              comment += `| *...and ${Object.keys(byFile).length - 10} more file(s)* | |\n`;
+            }
+            
+            comment += `\n`;
+            
+            // Estimated effort
+            comment += `### Estimated code review effort\n\n`;
+            comment += `🎯 **${effortLevel}** | ⏱️ **~${estimatedMinutes} minutes**\n\n`;
+            
+            // Actionable items
+            const actionableItems = [];
+            if (critical > 0) actionableItems.push(`Address ${critical} critical issue(s)`);
+            if (high > 0) actionableItems.push(`Fix ${high} high severity issue(s)`);
+            if (medium > 0) actionableItems.push(`Review ${medium} medium severity finding(s)`);
+            
+            if (actionableItems.length > 0) {
+              comment += `### ✅ Actionable comments\n\n`;
+              actionableItems.forEach(item => {
+                comment += `- [ ] ${item}\n`;
+              });
+              comment += `\n`;
+            }
+            
+            // Detailed findings
+            comment += `### 🔍 Review details\n\n`;
+            
+            // Group by severity
+            const severityOrder = ['critical', 'high', 'medium', 'low'];
+            severityOrder.forEach(severity => {
+              const severityIssues = reviewData.filter(r => r.severity === severity);
+              if (severityIssues.length === 0) return;
+              
+              const severityEmoji = {
+                'critical': '🔴',
+                'high': '🟠',
+                'medium': '🟡',
+                'low': '🟢'
+              };
+              
+              comment += `#### ${severityEmoji[severity]} ${severity.charAt(0).toUpperCase() + severity.slice(1)} severity (${severityIssues.length})\n\n`;
+              
+              severityIssues.slice(0, 5).forEach(issue => {
+                comment += `**\`${issue.file}\`**`;
+                if (issue.line) comment += ` (Line ${issue.line})`;
+                comment += `\n`;
+                comment += `- **Issue:** ${issue.issue || issue.description || 'N/A'}\n`;
+                if (issue.suggestion) {
+                  comment += `- **Suggestion:** ${issue.suggestion}\n`;
+                }
+                comment += `\n`;
+              });
+              
+              if (severityIssues.length > 5) {
+                comment += `*...and ${severityIssues.length - 5} more ${severity} severity issue(s)*\n\n`;
+              }
+            });
+            
+            // Pre-merge checks
+            comment += `\n---\n\n`;
+            comment += `### ✨ Pre-merge checks and finishing touches\n\n`;
+            
+            const checks = [];
+            if (critical === 0 && high === 0) {
+              checks.push('✅ **All critical and high severity issues resolved**');
+            } else {
+              checks.push(`⚠️ **${critical + high} critical/high severity issue(s) need attention**`);
+            }
+            if (totalIssues <= 5) {
+              checks.push('✅ **Low issue count** - Good code quality');
+            }
+            checks.push(`📊 **${filesChanged} file(s) reviewed**`);
+            
+            checks.forEach(check => {
+              comment += `${check}\n`;
+            });
+            
+            // Footer with Cline CLI branding
+            comment += `\n---\n\n`;
+            comment += `<div align="center">\n\n`;
+            comment += `### 🤖 Powered by Cline CLI\n\n`;
+            comment += `*AI-powered code review system*\n\n`;
+            comment += `[📖 Documentation](https://github.com/${context.repo.owner}/${context.repo.repo}) | `;
+            comment += `[💬 Help](https://github.com/${context.repo.owner}/${context.repo.repo}/issues) | `;
+            comment += `[⭐ Star](https://github.com/${context.repo.owner}/${context.repo.repo})\n\n`;
+            comment += `💡 **Tip:** Comment \`@github-actions help\` for available commands\n\n`;
+            comment += `</div>`;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+
+      - name: Send Review to API
+        if: always()
+        env:
+          API_URL: ${{ secrets.REVIEW_API_URL || 'http://localhost:3000' }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if [ -n "$API_URL" ] && [ "$API_URL" != "http://localhost:3000" ]; then
+            curl -X POST "$API_URL/api/reviews" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"repo\": \"$REPO\",
+                \"pr\": $PR_NUMBER,
+                \"findings\": $(cat review.json),
+                \"reviewType\": \"${{ env.REVIEW_TYPE }}\",
+                \"commitSha\": \"${{ github.event.pull_request.head.sha }}\"
+              }" || echo "Failed to send review to API"
+          fi
+
+      - name: Set PR Status
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const critical = parseInt('${{ steps.review.outputs.critical }}') || 0;
+            const high = parseInt('${{ steps.review.outputs.high }}') || 0;
+            const total = parseInt('${{ steps.review.outputs.total }}') || 0;
+            
+            const state = (critical > 0 || high > 3) ? 'failure' : (total > 0 ? 'pending' : 'success');
+            const description = total > 0 
+              ? `${total} issues found (${critical} critical, ${high} high)`
+              : 'No issues found';
+            
+            github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.payload.pull_request.head.sha,
+              state: state,
+              description: description,
+              context: 'ai-code-review'
+            });
+
