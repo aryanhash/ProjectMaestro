@@ -30,9 +30,9 @@ jobs:
           node-version: '20'
           cache: 'npm'
 
-      - name: Install dependencies
+      - name: Install Cline CLI
         run: |
-          npm install -g jq || echo "jq install failed, will use fallback"
+          npm install -g @cline/cli || npm install -g klein-cli || echo "Using npx fallback"
 
       - name: Get PR diff
         id: pr_diff
@@ -44,21 +44,17 @@ jobs:
             BASE_SHA="main"
             HEAD_SHA="HEAD"
           fi
-          echo "Base SHA: $BASE_SHA"
-          echo "Head SHA: $HEAD_SHA"
-          git diff $BASE_SHA...$HEAD_SHA > pr.diff || git diff origin/$BASE_SHA...HEAD > pr.diff
-          echo "Diff size: $(wc -c < pr.diff)"
-          if [ ! -s pr.diff ]; then
-            echo "Warning: PR diff is empty"
-            echo "No changes to review" > pr.diff
-          fi
+          git diff $BASE_SHA...$HEAD_SHA > pr.diff
+          echo "diff_size=$(wc -c < pr.diff)" >> $GITHUB_OUTPUT
 
-      - name: Run AI Review (Fallback to LLM)
+      - name: Run AI Review
         id: review
         env:
+          CLINE_API_KEY: ${{ secrets.CLINE_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           REVIEW_TYPE: ${{ github.event.inputs.review_type || 'general' }}
         run: |
-          REVIEW_TYPE="$REVIEW_TYPE"
+          REVIEW_TYPE="${{ env.REVIEW_TYPE }}"
           
           case "$REVIEW_TYPE" in
             "security")
@@ -75,81 +71,42 @@ jobs:
               ;;
           esac
           
+          # Build prompt with diff content
+          DIFF_CONTENT=$(cat pr.diff | head -c 50000)
           FULL_PROMPT="$PROMPT
 
 Here is the PR diff to review:
 
-\`\`\`
-$(head -c 10000 pr.diff)
+\`\`\`diff
+$DIFF_CONTENT
 \`\`\`
 
 Please analyze the code and output your findings as a JSON array."
-
-          # Try Cline CLI first, then fallback to generating mock review
-          echo "Attempting to run review..."
           
-          # Generate a basic review based on the diff content
-          cat > review.json << 'EOF'
-          [
-            {
-              "severity": "high",
-              "file": "test-review-example.ts",
-              "line": 6,
-              "issue": "SQL injection vulnerability: User input is directly concatenated into SQL query",
-              "suggestion": "Use parameterized queries or prepared statements",
-              "category": "security"
-            },
-            {
-              "severity": "critical",
-              "file": "test-review-example.ts",
-              "line": 19,
-              "issue": "Hardcoded credentials found: password and secretKey variables",
-              "suggestion": "Move credentials to environment variables or secure vault",
-              "category": "security"
-            },
-            {
-              "severity": "high",
-              "file": "test-review-example.ts",
-              "line": 12,
-              "issue": "N+1 query problem: Fetching posts for each user individually",
-              "suggestion": "Use batch query or join to fetch all posts at once",
-              "category": "performance"
-            },
-            {
-              "severity": "medium",
-              "file": "test-review-example.ts",
-              "line": 18,
-              "issue": "Missing error handling: Division by zero not checked",
-              "suggestion": "Add validation to check if divisor is zero before division",
-              "category": "bug"
-            },
-            {
-              "severity": "low",
-              "file": "test-review-example.ts",
-              "line": 22,
-              "issue": "Inconsistent naming convention: API_KEY uses UPPER_SNAKE_CASE but baseUrl uses camelCase",
-              "suggestion": "Use consistent naming convention (prefer UPPER_SNAKE_CASE for constants)",
-              "category": "style"
-            }
-          ]
-          EOF
+          if command -v cline &> /dev/null; then
+            cline "$FULL_PROMPT" --file pr.diff --yolo --output-format json > review.json 2>/dev/null || \
+            cline "$FULL_PROMPT" --yolo --output-format json > review.json 2>/dev/null || \
+            echo '[]' > review.json
+          elif command -v klein &> /dev/null; then
+            cat pr.diff | klein -y "$PROMPT" | jq -c '.' > review.json || echo '[]' > review.json
+          else
+            npx -y @cline/cli "$FULL_PROMPT" --file pr.diff --yolo --output-format json > review.json 2>/dev/null || \
+            npx -y @cline/cli "$FULL_PROMPT" --yolo --output-format json > review.json 2>/dev/null || \
+            echo '[]' > review.json
+          fi
           
-          echo "Review generated successfully"
-          
-          # Count findings
-          CRITICAL=$(grep -c '"severity": "critical"' review.json || echo "0")
-          HIGH=$(grep -c '"severity": "high"' review.json || echo "0")
-          MEDIUM=$(grep -c '"severity": "medium"' review.json || echo "0")
-          LOW=$(grep -c '"severity": "low"' review.json || echo "0")
-          TOTAL=$(grep -c '"severity":' review.json || echo "0")
+          # Parse and count findings
+          CRITICAL=$(jq '[.[] | select(.severity == "critical")] | length' review.json || echo "0")
+          HIGH=$(jq '[.[] | select(.severity == "high")] | length' review.json || echo "0")
+          MEDIUM=$(jq '[.[] | select(.severity == "medium")] | length' review.json || echo "0")
+          LOW=$(jq '[.[] | select(.severity == "low")] | length' review.json || echo "0")
+          TOTAL=$(jq '. | length' review.json || echo "0")
           
           echo "critical=$CRITICAL" >> $GITHUB_OUTPUT
           echo "high=$HIGH" >> $GITHUB_OUTPUT
           echo "medium=$MEDIUM" >> $GITHUB_OUTPUT
           echo "low=$LOW" >> $GITHUB_OUTPUT
           echo "total=$TOTAL" >> $GITHUB_OUTPUT
-          
-          echo "Review summary: Critical=$CRITICAL, High=$HIGH, Medium=$MEDIUM, Low=$LOW, Total=$TOTAL"
 
       - name: Upload Review Artifact
         uses: actions/upload-artifact@v4
@@ -165,15 +122,7 @@ Please analyze the code and output your findings as a JSON array."
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const fs = require('fs');
-            let reviewData = [];
-            
-            try {
-              const reviewContent = fs.readFileSync('review.json', 'utf8');
-              reviewData = JSON.parse(reviewContent);
-            } catch (error) {
-              console.error('Error reading review.json:', error);
-              reviewData = [];
-            }
+            const reviewData = JSON.parse(fs.readFileSync('review.json', 'utf8') || '[]');
             
             // Get PR details
             const pr = context.payload.pull_request;
@@ -237,7 +186,7 @@ Please analyze the code and output your findings as a JSON array."
               ? `This PR introduces changes across ${Object.keys(byFile).length} file(s). ${totalIssues} review findings were identified, with ${critical} critical, ${high} high, ${medium} medium, and ${low} low severity issues.`
               : `Review completed with ${totalIssues} findings identified.`;
             
-            // Build the comment
+            // Build the comment with Cline CLI branding
             let comment = `<div align="center">\n\n`;
             comment += `### 🤖 Cline CLI Code Review\n\n`;
             comment += `![Cline CLI](https://img.shields.io/badge/Powered%20by-Cline%20CLI-blue?style=for-the-badge&logo=github)\n\n`;
@@ -344,7 +293,7 @@ Please analyze the code and output your findings as a JSON array."
               comment += `${check}\n`;
             });
             
-            // Footer
+            // Footer with Cline CLI branding
             comment += `\n---\n\n`;
             comment += `<div align="center">\n\n`;
             comment += `### 🤖 Powered by Cline CLI\n\n`;
@@ -361,6 +310,25 @@ Please analyze the code and output your findings as a JSON array."
               repo: context.repo.repo,
               body: comment
             });
+
+      - name: Send Review to API
+        if: always()
+        env:
+          API_URL: ${{ secrets.REVIEW_API_URL || 'http://localhost:3000' }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if [ -n "$API_URL" ] && [ "$API_URL" != "http://localhost:3000" ]; then
+            curl -X POST "$API_URL/api/reviews" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"repo\": \"$REPO\",
+                \"pr\": $PR_NUMBER,
+                \"findings\": $(cat review.json),
+                \"reviewType\": \"${{ env.REVIEW_TYPE }}\",
+                \"commitSha\": \"${{ github.event.pull_request.head.sha }}\"
+              }" || echo "Failed to send review to API"
+          fi
 
       - name: Set PR Status
         if: github.event_name == 'pull_request'
@@ -383,5 +351,6 @@ Please analyze the code and output your findings as a JSON array."
               sha: context.payload.pull_request.head.sha,
               state: state,
               description: description,
-              context: 'cline-cli-review'
+              context: 'ai-code-review'
             });
+
