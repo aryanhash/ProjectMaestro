@@ -1,0 +1,22 @@
+{
+  "version": 2,
+  "builds": [
+    {
+      "src": "package.json",
+      "use": "@vercel/next"
+    }
+  ],
+  "functions": {
+    "app/api/**/*.ts": {
+      "maxDuration": 30,
+      "memory": 1024
+    }
+  },
+  "env": {
+    "TOGETHER_AI_API_KEY": "@together_ai_api_key",
+    "GITHUB_TOKEN": "@github_token",
+    "VERCEL_DEPLOY_HOOK": "@vercel_deploy_hook",
+    "VERCEL_PROJECT_ID": "@vercel_project_id"
+  }
+}
+
