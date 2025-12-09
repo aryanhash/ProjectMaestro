@@ -1,6 +1,6 @@
-# CodeRabbit-style PR Review System
+# Cline CLI PR Review System
 
-A complete AI-powered code review system using Cline CLI, integrated with GitHub Actions, and featuring a comprehensive health dashboard.
+A complete AI-powered code review system using **Cline CLI** (not CodeRabbit), integrated with GitHub Actions, and featuring a comprehensive health dashboard.
 
 ## 🎯 Features
 
@@ -304,7 +304,7 @@ npx -y @cline/cli review ...
 
 ## 🏆 Hackathon Pitch
 
-> "We built an autonomous AI reviewer that lives in CI/CD, reviews PRs like CodeRabbit, blocks insecure commits, and gives a live health dashboard for engineering leaders."
+> "We built an autonomous AI reviewer using Cline CLI that lives in CI/CD, automatically reviews PRs, blocks insecure commits, and gives a live health dashboard for engineering leaders."
 
 ### Why Judges Will Love It:
 
